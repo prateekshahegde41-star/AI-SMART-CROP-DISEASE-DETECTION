@@ -16,5 +16,6 @@ plotly
 rapidfuzz
 streamlit-cookies-controller
 torch
+torchvision
 # Install separately (CPU build is enough for inference):
 #   pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
