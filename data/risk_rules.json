@@ -1,0 +1,13 @@
+{
+  "_note": "Indicative rule-of-thumb thresholds. Verify/tune against ICAR or state agri-university sources and cite them in the demo.",
+  "late_blight":     {"temp_c": [10, 24], "humidity_min": 90, "rain_mm_min": 1},
+  "early_blight":    {"temp_c": [24, 29], "humidity_min": 80},
+  "bacterial_spot":  {"temp_c": [24, 30], "humidity_min": 85, "rain_mm_min": 1},
+  "leaf_mold":       {"temp_c": [20, 25], "humidity_min": 85},
+  "septoria":        {"temp_c": [20, 25], "humidity_min": 85, "rain_mm_min": 1},
+  "powdery_mildew":  {"temp_c": [20, 30], "humidity_min": 50, "humidity_max": 80},
+  "rust":            {"temp_c": [16, 25], "humidity_min": 80},
+  "scab":            {"temp_c": [10, 24], "humidity_min": 85, "rain_mm_min": 1},
+  "black_rot":       {"temp_c": [20, 30], "humidity_min": 85, "rain_mm_min": 1},
+  "default":         {"temp_c": [18, 30], "humidity_min": 80}
+}

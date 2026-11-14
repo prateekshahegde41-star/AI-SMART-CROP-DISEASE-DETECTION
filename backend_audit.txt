@@ -1,0 +1,605 @@
+
+
+========== db.py ==========
+
+"""Supabase access (service-role key stays here). Falls back to in-memory if not configured.
+Owner: Group 2 (Shravani)."""
+import os, random, uuid
+from collections import defaultdict
+from datetime import datetime, timezone
+
+_MEM: list[dict] = []
+_client_cache = {}
+
+
+def _client():
+    if "c" in _client_cache:
+        return _client_cache["c"]
+    url, key = os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_SERVICE_KEY")
+    c = None
+    if url and key:
+        from supabase import create_client
+        c = create_client(url, key)
+    _client_cache["c"] = c
+    return c
+
+
+def save_prediction(row: dict) -> str:
+    c = _client()
+    if c:
+        return c.table("predictions").insert(row).execute().data[0]["id"]
+    row = {**row, "id": str(uuid.uuid4()), "created_at": datetime.now(timezone.utc).isoformat(),
+           "status": "pending"}
+    _MEM.append(row)
+    return row["id"]
+
+
+def history(farmer_id: str, limit: int = 50) -> list[dict]:
+    cols = "id,created_at,label,confidence,severity_pct,severity_level,trend,risk_now,status,expert_label"
+    c = _client()
+    if c:
+        return (c.table("predictions").select(cols).eq("farmer_id", farmer_id)
+                .order("created_at", desc=True).limit(limit).execute().data)
+    keys = cols.split(",")
+    rows = [r for r in _MEM if r.get("farmer_id") == farmer_id]
+    return [{k: r.get(k) for k in keys} for r in reversed(rows)][:limit]
+
+
+def queue(limit: int = 50) -> list[dict]:
+    c = _client()
+    if c:
+        rows = (c.table("predictions").select("*").eq("status", "pending")
+                .eq("is_synthetic", False).order("confidence").limit(limit).execute().data)
+    else:
+        rows = [r for r in _MEM if r.get("status") == "pending" and not r.get("is_synthetic")]
+    rows = sorted(rows, key=lambda r: (not r.get("needs_review"), r.get("confidence") or 0))
+    for r in rows:
+        r.pop("report", None)
+    return rows[:limit]
+
+
+def verify(pid: str, decision: str, expert_label: str | None, notes: str) -> bool:
+    c = _client()
+    now = datetime.now(timezone.utc).isoformat()
+    if c:
+        cur = c.table("predictions").select("label").eq("id", pid).execute().data
+        if not cur:
+            return False
+        final = expert_label if decision == "corrected" else cur[0]["label"]
+        c.table("predictions").update({"status": decision, "expert_label": final,
+                                       "expert_notes": notes, "verified_at": now}).eq("id", pid).execute()
+        c.table("verifications").insert({"prediction_id": pid, "decision": decision,
+                                         "original_label": cur[0]["label"], "expert_label": final,
+                                         "notes": notes}).execute()
+        return True
+    for r in _MEM:
+        if r["id"] == pid:
+            r.update(status=decision, expert_notes=notes, verified_at=now,
+                     expert_label=expert_label if decision == "corrected" else r["label"])
+            return True
+    return False
+
+
+def hotspots(grid: float = 0.1) -> list[dict]:
+    c = _client()
+    if c:
+        rows = c.table("predictions").select("lat,lon,label,is_synthetic").not_.is_("lat", "null").limit(5000).execute().data
+    else:
+        rows = [r for r in _MEM if r.get("lat") is not None]
+    agg = defaultdict(lambda: {"count": 0, "synthetic": 0})
+    for r in rows:
+        if "healthy" in (r.get("label") or "").lower():
+            continue
+        k = (round(r["lat"] / grid) * grid, round(r["lon"] / grid) * grid, r["label"])
+        agg[k]["count"] += 1
+        agg[k]["synthetic"] += 1 if r.get("is_synthetic") else 0
+    return [{"lat": round(k[0], 3), "lon": round(k[1], 3), "label": k[2], **v} for k, v in agg.items()]
+
+
+def seed_demo() -> int:
+    """Synthetic outbreak reports for the demo map. Always flagged is_synthetic=True."""
+    places = [("Tomato___Late_blight", 15.85, 74.50), ("Tomato___Late_blight", 15.46, 75.01),
+              ("Tomato___Late_blight", 15.36, 75.12), ("Potato___Early_blight", 12.30, 76.64),
+              ("Potato___Early_blight", 12.52, 76.90), ("Corn_(maize)___Common_rust_", 16.21, 77.35),
+              ("Corn_(maize)___Common_rust_", 16.83, 75.71)]
+    n = 0
+    for label, lat, lon in places:
+        for _ in range(random.randint(6, 14)):
+            save_prediction({"farmer_id": "synthetic", "label": label, "confidence": 0.9,
+                             "severity_pct": round(random.uniform(5, 40), 1), "severity_level": "Medium",
+                             "trend": "spreading", "risk_now": "High",
+                             "lat": lat + random.uniform(-.15, .15), "lon": lon + random.uniform(-.15, .15),
+                             "needs_review": False, "is_synthetic": True})
+            n += 1
+    return n
+
+
+========== guidance.py ==========
+
+"""Curated, cited disease guidance. Owner: Group 2 (Shravani)."""
+import json
+from pathlib import Path
+
+DATA = json.loads((Path(__file__).resolve().parent.parent / "data" / "guidance.json").read_text())
+DISCLAIMER = ("General information only - not a substitute for advice from an "
+              "agricultural expert.")
+
+
+def get(label: str) -> dict:
+    entry = DATA.get(label) or DATA["_default"]
+    return {**entry, "disclaimer": DISCLAIMER}
+
+
+========== main.py ==========
+
+"""FastAPI backend. Run from repo root:  uvicorn api.main:app --reload
+Owner: Group 2 (Shravani) - integrates Group 1's model/severity/progression."""
+import asyncio, base64, os
+from dotenv import load_dotenv
+load_dotenv()
+
+import cv2, numpy as np
+from fastapi import FastAPI, File, Form, UploadFile, Header, HTTPException
+from pydantic import BaseModel
+
+from . import db, guidance, model, progression, risk, severity, validate, weather
+
+app = FastAPI(title="Agri AI - Smart Disease Detection")
+CONF_REVIEW = 0.70
+
+
+def _b64(bgr, quality=80, max_side=None) -> str:
+    if max_side and max(bgr.shape[:2]) > max_side:
+        s = max_side / max(bgr.shape[:2])
+        bgr = cv2.resize(bgr, None, fx=s, fy=s, interpolation=cv2.INTER_AREA)
+    ok, buf = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, quality])
+    return base64.b64encode(buf).decode()
+
+
+def require_admin(key: str):
+    if key != os.getenv("ADMIN_KEY", "change-me"):
+        raise HTTPException(401, "Admin key required")
+
+
+async def _safe_weather(lat, lon):
+    if lat is None or lon is None:
+        return None
+    try:
+        return await asyncio.to_thread(weather.fetch, lat, lon)
+    except Exception as e:
+        print("[weather] failed:", e)
+        return None
+
+
+def _process(items):
+    out = []
+    for it in items:
+        bgr = cv2.cvtColor(np.array(it.img), cv2.COLOR_RGB2BGR)
+        out.append({"pred": model.predict(it.img), "sev": severity.estimate(bgr), "item": it})
+    return out
+
+
+@app.get("/health")
+def health():
+    return {"ok": True}
+
+
+@app.get("/classes")
+def classes():
+    return model.classes()
+
+
+@app.post("/analyze")
+async def analyze(files: list[UploadFile] = File(...), lat: float | None = Form(None),
+                  lon: float | None = Form(None), farmer_id: str = Form("demo-farmer"),
+                  with_gradcam: bool = Form(False)):
+    items = await validate.load_images(files)
+    items, time_source = progression.order(items)
+    wx_task = asyncio.create_task(_safe_weather(lat, lon))          # runs in parallel with the model
+    res = await asyncio.to_thread(_process, items)
+    wx = await wx_task
+
+    best = max(res, key=lambda r: r["pred"]["confidence"])
+    label, conf = best["pred"]["label"], best["pred"]["confidence"]
+    healthy = "healthy" in label.lower()
+    series = [0.0 if healthy else r["sev"]["percent"] for r in res]
+    latest = res[-1]["sev"]
+    sev_pct = series[-1]
+    sev_level = "None" if healthy else latest["level"]
+
+    risk_out = (risk.assess(label, wx["daily"], sev_level) if wx
+                else {"now": "Unknown", "next_7_days": [], "note": "Weather unavailable (no location or API error)."})
+    rep = {
+        "prediction": {"label": label, "confidence": round(conf, 3), "top": best["pred"]["top"],
+                       "stub": best["pred"].get("stub", False)},
+        "severity": {"percent": sev_pct, "level": sev_level, "leaf_detected": latest["leaf_ok"]},
+        "progression": {"trend": progression.trend(series), "series": series, "time_source": time_source},
+        "weather": wx["current"] if wx else None,
+        "risk": risk_out,
+        "guidance": guidance.get(label),
+        "needs_review": conf < CONF_REVIEW,
+    }
+    thumb = _b64(cv2.cvtColor(np.array(items[-1].img), cv2.COLOR_RGB2BGR), 70, 320)
+    saved = {k: v for k, v in rep.items()}
+    pid = await asyncio.to_thread(db.save_prediction, {
+        "farmer_id": farmer_id, "label": label, "confidence": conf, "severity_pct": sev_pct,
+        "severity_level": sev_level, "trend": rep["progression"]["trend"], "risk_now": risk_out["now"],
+        "lat": lat, "lon": lon, "image_thumb": thumb, "report": saved, "needs_review": rep["needs_review"]})
+
+    rep["id"] = pid
+    rep["severity"]["overlay_b64"] = _b64(latest["overlay_bgr"]) if not healthy else None
+    rep["gradcam_b64"] = (await asyncio.to_thread(model.gradcam_overlay_b64, best["item"].img)
+                          if with_gradcam else None)
+    return rep
+
+
+@app.get("/history")
+def history(farmer_id: str = "demo-farmer"):
+    return db.history(farmer_id)
+
+
+@app.get("/hotspots")
+def hotspots():
+    return db.hotspots()
+
+
+class Verification(BaseModel):
+    prediction_id: str
+    decision: str            # confirmed | corrected | rejected
+    expert_label: str | None = None
+    notes: str = ""
+
+
+@app.get("/admin/queue")
+def admin_queue(x_admin_key: str = Header(default="")):
+    require_admin(x_admin_key)
+    return db.queue()
+
+
+@app.post("/admin/verify")
+def admin_verify(v: Verification, x_admin_key: str = Header(default="")):
+    require_admin(x_admin_key)
+    if v.decision not in ("confirmed", "corrected", "rejected"):
+        raise HTTPException(400, "Bad decision")
+    if v.decision == "corrected" and not v.expert_label:
+        raise HTTPException(400, "expert_label required for corrected")
+    if not db.verify(v.prediction_id, v.decision, v.expert_label, v.notes):
+        raise HTTPException(404, "Prediction not found")
+    return {"ok": True}
+
+
+@app.post("/admin/seed")
+def admin_seed(x_admin_key: str = Header(default="")):
+    require_admin(x_admin_key)
+    return {"seeded_synthetic_reports": db.seed_demo()}
+
+
+========== model.py ==========
+
+"""EfficientNet-B0 inference (+ Grad-CAM). Owner: Group 1 (Omkar).
+
+If models/efficientnet_b0.pt is missing, a STUB is used so the other group can
+build against the API before training finishes.
+"""
+import io, json, base64
+from pathlib import Path
+
+import numpy as np
+from PIL import Image
+
+ROOT = Path(__file__).resolve().parent.parent
+MODEL_PATH = ROOT / "models" / "efficientnet_b0.pt"
+CLASSES_PATH = ROOT / "models" / "classes.json"
+
+_state = {"model": None, "classes": None, "tf": None, "stub": None}
+
+
+def _load():
+    if _state["stub"] is not None:
+        return
+    if not (MODEL_PATH.exists() and CLASSES_PATH.exists()):
+        _state.update(stub=True, classes=["Tomato___Late_blight", "Tomato___healthy"])
+        print("[model] WEIGHTS NOT FOUND -> running in STUB mode")
+        return
+    import torch, torch.nn as nn
+    from torchvision import models, transforms
+    classes = json.loads(CLASSES_PATH.read_text())
+    m = models.efficientnet_b0(weights=None)
+    m.classifier[1] = nn.Linear(m.classifier[1].in_features, len(classes))
+    m.load_state_dict(torch.load(MODEL_PATH, map_location="cpu"))
+    m.eval()
+    _state["tf"] = transforms.Compose([
+        transforms.Resize((224, 224)), transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])])
+    _state.update(model=m, classes=classes, stub=False)
+
+
+def classes() -> list[str]:
+    _load()
+    return _state["classes"]
+
+
+def predict(img: Image.Image, topk: int = 3) -> dict:
+    _load()
+    if _state["stub"]:
+        return {"label": "Tomato___Late_blight", "confidence": 0.55,
+                "top": [{"label": "Tomato___Late_blight", "confidence": 0.55}], "stub": True}
+    import torch
+    x = _state["tf"](img).unsqueeze(0)
+    with torch.no_grad():
+        p = torch.softmax(_state["model"](x), dim=1)[0]
+    conf, idx = p.topk(min(topk, len(p)))
+    top = [{"label": _state["classes"][i], "confidence": float(c)} for c, i in zip(conf, idx)]
+    return {"label": top[0]["label"], "confidence": top[0]["confidence"], "top": top, "stub": False}
+
+
+def gradcam_overlay_b64(img: Image.Image) -> str | None:
+    """'Model attention' heat-map (NOT lesion segmentation). None in stub mode."""
+    _load()
+    if _state["stub"]:
+        return None
+    import torch, torch.nn.functional as F, cv2
+    m, x = _state["model"], _state["tf"](img).unsqueeze(0)
+    acts = {}
+    h = m.features[-1].register_forward_hook(lambda mod, i, o: acts.__setitem__("a", o))
+    out = m(x)
+    h.remove()
+    a = acts["a"]
+    grad = torch.autograd.grad(out[0, out[0].argmax()], a)[0]
+    cam = F.relu((grad.mean(dim=(2, 3), keepdim=True) * a).sum(1, keepdim=True))
+    cam = F.interpolate(cam, size=img.size[::-1], mode="bilinear", align_corners=False)[0, 0]
+    cam = ((cam - cam.min()) / (cam.max() - cam.min() + 1e-8)).detach().numpy()
+    heat = cv2.applyColorMap((cam * 255).astype(np.uint8), cv2.COLORMAP_JET)
+    base = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+    mix = cv2.addWeighted(base, 0.55, heat, 0.45, 0)
+    ok, buf = cv2.imencode(".jpg", mix, [cv2.IMWRITE_JPEG_QUALITY, 80])
+    return base64.b64encode(buf).decode()
+
+
+========== progression.py ==========
+
+"""Ordering by time + trend from severity series. Owner: Group 1 (Prateeksha)."""
+TOLERANCE_PCT = 3.0   # change smaller than this = 'unchanged'
+
+
+def order(items):
+    """Sort by EXIF time if ALL images have it, else keep upload order (oldest first)."""
+    if len(items) > 1 and all(i.taken_at for i in items):
+        return sorted(items, key=lambda i: i.taken_at), "exif"
+    return items, "upload_order"
+
+
+def trend(series: list[float]) -> str:
+    if len(series) < 2:
+        return "single image"
+    d = series[-1] - series[0]
+    if d > TOLERANCE_PCT:
+        return "spreading"
+    if d < -TOLERANCE_PCT:
+        return "improving"
+    return "unchanged"
+
+
+========== risk.py ==========
+
+"""Rule-based environmental risk (today + next 7 days). Owner: Group 2 (Shravani)."""
+import json
+from pathlib import Path
+
+RULES = json.loads((Path(__file__).resolve().parent.parent / "data" / "risk_rules.json").read_text())
+ORDER = ["Low", "Medium", "High"]
+
+
+def _rule_for(label: str) -> dict:
+    key = label.lower().replace("___", "_").replace(" ", "_")
+    for name, rule in RULES.items():
+        if name not in ("default", "_note") and name in key:
+            return rule
+    return RULES["default"]
+
+
+def _day_level(rule: dict, day: dict) -> str:
+    checks = []
+    lo, hi = rule["temp_c"]
+    checks.append(lo <= day["t_mean"] <= hi)
+    checks.append(day["humidity"] >= rule["humidity_min"])
+    if "humidity_max" in rule:
+        checks.append(day["humidity"] <= rule["humidity_max"])
+    if "rain_mm_min" in rule:
+        checks.append(day["rain_mm"] >= rule["rain_mm_min"])
+    ratio = sum(checks) / len(checks)
+    return "High" if ratio == 1 else "Medium" if ratio >= 0.66 else "Low"
+
+
+def assess(label: str, daily: list[dict], severity_level: str) -> dict:
+    if "healthy" in label.lower():
+        return {"now": "Low", "next_7_days": ["Low"] * len(daily),
+            "dates": [d["date"] for d in daily], "note": "Plant looks healthy."}
+    rule = _rule_for(label)
+    levels = [_day_level(rule, d) for d in daily]
+    now = levels[0]
+    if severity_level == "High" and now != "High":      # existing heavy infection raises concern
+        now = ORDER[ORDER.index(now) + 1]
+    return {"now": now, "next_7_days": levels, "dates": [d["date"] for d in daily],
+            "note": "Indicative rule-of-thumb thresholds, not a forecast model."}
+
+
+========== severity.py ==========
+
+"""Leaf mask + lesion mask + severity %. Owner: Group 1 (Prateeksha).
+
+Baseline = classic OpenCV (works with no training). Pipeline:
+  1. leaf mask (GrabCut, fallback: saturation threshold)
+  2. inside the leaf, anything that is NOT healthy-green = lesion
+  3. severity % = lesion pixels / leaf pixels
+Tune HEALTHY_* and LEVELS on real samples. A U-Net can replace estimate() later
+with the same return shape.
+"""
+import cv2
+import numpy as np
+
+HEALTHY_H = (35, 85)     # OpenCV hue range for green (0-179)
+HEALTHY_S_MIN = 40
+HEALTHY_V_MIN = 40
+LEVELS = [(10.0, "Low"), (30.0, "Medium")]   # <10 Low, <30 Medium, else High
+MAX_SIDE = 512
+
+
+def level_for(pct: float) -> str:
+    for limit, name in LEVELS:
+        if pct < limit:
+            return name
+    return "High"
+
+
+def leaf_mask(bgr: np.ndarray) -> np.ndarray:
+    h, w = bgr.shape[:2]
+    mask = np.zeros((h, w), np.uint8)
+    rect = (int(w * .04), int(h * .04), int(w * .92), int(h * .92))
+    try:
+        cv2.grabCut(bgr, mask, rect, np.zeros((1, 65)), np.zeros((1, 65)), 3, cv2.GC_INIT_WITH_RECT)
+        leaf = np.where((mask == cv2.GC_FGD) | (mask == cv2.GC_PR_FGD), 255, 0).astype(np.uint8)
+    except cv2.error:
+        leaf = np.zeros((h, w), np.uint8)
+    if leaf.sum() / 255 < 0.10 * h * w:                      # GrabCut failed -> colour fallback
+        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+        leaf = (hsv[..., 1] > 40).astype(np.uint8) * 255
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    leaf = cv2.morphologyEx(leaf, cv2.MORPH_CLOSE, k)
+    return cv2.morphologyEx(leaf, cv2.MORPH_OPEN, k)
+
+
+def estimate(bgr: np.ndarray) -> dict:
+    """bgr uint8 image -> {percent, level, overlay_bgr, leaf_ok}"""
+    scale = MAX_SIDE / max(bgr.shape[:2])
+    if scale < 1:
+        bgr = cv2.resize(bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+    leaf = leaf_mask(bgr)
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    H, S, V = cv2.split(hsv)
+    healthy = (H >= HEALTHY_H[0]) & (H <= HEALTHY_H[1]) & (S >= HEALTHY_S_MIN) & (V >= HEALTHY_V_MIN)
+    lesion = ((leaf > 0) & ~healthy).astype(np.uint8) * 255
+    lesion = cv2.morphologyEx(lesion, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+
+    leaf_px = max(int((leaf > 0).sum()), 1)
+    pct = round(100.0 * int((lesion > 0).sum()) / leaf_px, 1)
+
+    overlay = bgr.copy()
+    red = np.zeros_like(bgr); red[:] = (0, 0, 255)
+    sel = lesion > 0
+    overlay[sel] = cv2.addWeighted(bgr, 0.45, red, 0.55, 0)[sel]
+    cnts, _ = cv2.findContours(leaf, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cv2.drawContours(overlay, cnts, -1, (0, 255, 0), 2)
+    return {"percent": pct, "level": level_for(pct), "overlay_bgr": overlay,
+            "leaf_ok": leaf_px > 0.10 * bgr.shape[0] * bgr.shape[1]}
+
+
+========== validate.py ==========
+
+"""Image validation + loading. Owner: Group 1 (Prateeksha)."""
+import io
+from dataclasses import dataclass
+from datetime import datetime
+
+from fastapi import HTTPException, UploadFile
+from PIL import Image, ImageOps
+
+MAX_BYTES = 8 * 1024 * 1024
+MAX_IMAGES = 4
+ALLOWED = {"image/jpeg", "image/png", "image/webp"}
+MIN_SIDE = 64
+
+
+@dataclass
+class Item:
+    name: str
+    img: Image.Image            # RGB, EXIF-rotated
+    taken_at: datetime | None   # from EXIF if present
+
+
+def _exif_time(im: Image.Image):
+    try:
+        exif = im.getexif()
+        raw = exif.get_ifd(0x8769).get(36867) or exif.get(306)  # DateTimeOriginal / DateTime
+        return datetime.strptime(str(raw), "%Y:%m:%d %H:%M:%S") if raw else None
+    except Exception:
+        return None
+
+
+async def load_images(files: list[UploadFile]) -> list[Item]:
+    if not files:
+        raise HTTPException(400, "Upload at least one leaf image.")
+    if len(files) > MAX_IMAGES:
+        raise HTTPException(400, f"At most {MAX_IMAGES} images allowed.")
+    items = []
+    for f in files:
+        data = await f.read()
+        if len(data) > MAX_BYTES:
+            raise HTTPException(400, f"{f.filename}: larger than 8 MB.")
+        if f.content_type not in ALLOWED:
+            raise HTTPException(400, f"{f.filename}: only JPEG/PNG/WEBP allowed.")
+        try:
+            im = Image.open(io.BytesIO(data))
+            im.load()
+        except Exception:
+            raise HTTPException(400, f"{f.filename}: not a readable image.")
+        taken = _exif_time(im)
+        im = ImageOps.exif_transpose(im).convert("RGB")
+        if min(im.size) < MIN_SIDE:
+            raise HTTPException(400, f"{f.filename}: image too small.")
+        items.append(Item(f.filename or "image", im, taken))
+    return items
+
+
+========== weather.py ==========
+
+"""Open-Meteo: current + 7-day weather and soil moisture. Owner: Group 2 (Shravani)."""
+import time
+import requests
+
+URL = "https://api.open-meteo.com/v1/forecast"
+_cache: dict = {}
+TTL = 3600
+
+
+def fetch(lat: float, lon: float) -> dict:
+    key = (round(lat, 1), round(lon, 1))
+    hit = _cache.get(key)
+    if hit and time.time() - hit[0] < TTL:
+        return hit[1]
+    r = requests.get(URL, timeout=10, params={
+        "latitude": lat, "longitude": lon, "timezone": "auto", "forecast_days": 7,
+        "current": "temperature_2m,relative_humidity_2m,precipitation,wind_speed_10m",
+        "hourly": "relative_humidity_2m,soil_moisture_0_to_1cm",
+        "daily": "temperature_2m_max,temperature_2m_min,precipitation_sum,wind_speed_10m_max",
+    })
+    r.raise_for_status()
+    j = r.json()
+
+    def day_mean(var):                       # average the hourly values per date
+        buckets: dict = {}
+        for t, v in zip(j["hourly"]["time"], j["hourly"][var]):
+            if v is not None:
+                buckets.setdefault(t[:10], []).append(v)
+        return {d: sum(v) / len(v) for d, v in buckets.items()}
+
+    hum, soil = day_mean("relative_humidity_2m"), day_mean("soil_moisture_0_to_1cm")
+    d = j["daily"]
+    daily = []
+    for i, date in enumerate(d["time"]):
+        tmax, tmin = d["temperature_2m_max"][i], d["temperature_2m_min"][i]
+        daily.append({"date": date, "t_max": tmax, "t_min": tmin, "t_mean": (tmax + tmin) / 2,
+                      "humidity": round(hum.get(date, 0), 1), "rain_mm": d["precipitation_sum"][i] or 0,
+                      "wind_kmh": d["wind_speed_10m_max"][i],
+                      "soil_moisture": round(soil.get(date, 0), 3)})
+    c = j["current"]
+    out = {"current": {"temp_c": c["temperature_2m"], "humidity": c["relative_humidity_2m"],
+                       "rain_mm": c["precipitation"], "wind_kmh": c["wind_speed_10m"],
+                       "soil_moisture": daily[0]["soil_moisture"]},
+           "daily": daily}
+    _cache[key] = (time.time(), out)
+    return out
+
+
+========== __init__.py ==========
+

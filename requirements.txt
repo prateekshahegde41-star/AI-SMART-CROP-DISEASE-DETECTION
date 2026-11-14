@@ -1,0 +1,19 @@
+fastapi
+uvicorn[standard]
+python-multipart
+pillow
+opencv-python-headless
+numpy
+requests
+python-dotenv
+supabase
+pandas
+streamlit
+streamlit-js-eval
+streamlit-folium
+folium
+plotly
+rapidfuzz
+streamlit-cookies-controller
+# Install separately (CPU build is enough for inference):
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
