@@ -15,5 +15,6 @@ folium
 plotly
 rapidfuzz
 streamlit-cookies-controller
+torch
 # Install separately (CPU build is enough for inference):
 #   pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
