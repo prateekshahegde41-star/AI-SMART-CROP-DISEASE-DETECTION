@@ -21,7 +21,10 @@ except (ImportError, ValueError):
             except Exception:
                 pass
             return os.getenv(key, default)
-        API_URL = get_config("API_URL", "http://localhost:8000")
+        API_URL = get_config(
+    "API_URL",
+    "https://ai-smart-crop-disease-detection.onrender.com"
+)
 
 try:
     from streamlit_cookies_controller import CookieController
