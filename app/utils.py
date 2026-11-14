@@ -11,7 +11,7 @@ def get_config(key: str, default: str = "") -> str:
         pass
     return os.getenv(key, default)
 
-API_URL = get_config("API_URL", "http://localhost:8000")
+API_URL = get_config("API_URL", "https://ai-smart-crop-disease-detection.onrender.com")
 LEVEL_ICON = {"Low": "🟢", "Medium": "🟡", "High": "🔴", "None": "🟢", "Unknown": "⚪"}
 
 def geocode(place: str):
